@@ -1,0 +1,828 @@
+---
+title: "Final Project 318"
+author: "Marley & Kai"
+date: "2022-11-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(usdm)
+library(Metrics)
+library(pROC)
+library(caret)
+library(bestglm)
+library(rcompanion)
+```
+
+```{r upload dataset}
+library("haven")
+raw.data<-read_xpt("/cloud/project/P_RHQ.XPT") # does not include demographics data. 
+```
+
+# Central Variables & Codes:
+SEQN - Respondent sequence number
+RHD280 - Had a Hysterectomy? 
+RHQ031 - Had regular periods in the past twelve months?
+RHD043 - Reason not having regular periods?
+RHQ076 - Seen a Doctor bc unable to become pregnant?
+RHQ131 - Ever been pregnant?
+RHQ160 - How many times have been pregnant?
+RHD167 - Total number of deliveries
+RHQ078 - Ever been treated for pelvic infection?
+RHD180 - Age at first live birth?
+RHD190 - Age at last live birth?
+RHQ540 - Ever use female hormones?
+
+```{r clarify data set to variables we are considering}
+#colnames(raw.data)
+data1<-raw.data[,c("SEQN", "RHD280", "RHQ031", "RHD043", "RHQ076", "RHQ131", "RHD143", "RHQ160", "RHD167", "RHQ078", "RHD180", "RHD190", "RHQ540")]
+#head(data1, 4)
+colnames(data1)<-c("ID", "hysterectomy", "regularPeriods", "periodReason", "doctor", "beenPregnant", "currentlyPregnant" , "numPregnant", "numDeliveries", "pelvicInfection", "ageFirstLiveBirth", "ageLastLiveBirth", "useFemaleHormones")
+head(data1, 4)
+```
+
+```{r demographics data}
+raw.demo<-read_xpt("/cloud/project/P_DEMO.XPT")
+#head(raw.demo, 4)
+```
+
+# Central Demographic Variables to consider:
+SEQN - Respondent sequence number
+RIDRETH3 - Race/Hispanic origin w/ NH Asian
+DMDBORN4 - Country of birth
+DMDYRUSZ - Length of time in US
+DMDEDUC2 - Education level - Adults 20+
+DMDMARTZ - Marital status
+SIALANG - Language of SP Interview
+SIAINTRP - Interpreter used in SP Interview?
+INDFMPIR - Ratio of family income to poverty
+```{r relevant variables to demo}
+demo.data1<-raw.demo[,c("SEQN","RIDAGEYR" ,"RIDRETH3", "DMDBORN4", "DMDYRUSZ", "DMDEDUC2", "DMDMARTZ", "SIALANG", "SIAINTRP", "INDFMPIR")]
+#head(demo.data1, 4)
+colnames(demo.data1)<-c("ID", "age", "race", "birthCountry", "timeInUS", "education", "maritalStatus", "interviewLanguage", "interpreter", "incomeToPovertyRatio")
+head(demo.data1, 4)
+```
+
+```{r create trimmed dataset w hysterectomy IDs}
+## first we should merge the demographics data and the hysterectomy data
+## get the ID from the data1 dataset, find it in the demo data, and store the row value in a vector. 
+data1$ID<-as.factor(data1$ID) #convert to factor
+# create a new demographic dataset to proliferate with these selected values
+demo.trimmed<-data.frame(matrix(ncol = ncol(demo.data1), nrow = 5314)) #5314 = total num observations in hysterectomy data
+colnames(demo.trimmed)<-colnames(demo.data1)
+IDs.handled<-0
+for (i in 1:nrow(data1)) {
+  IDs<-data1$ID # create list of IDs
+  i.ID<- IDs[i]  #get the IDin position i
+  #do all the ID's in the data1 dataset exist in the demo.data1 dataset
+  pos.in.demo<- which(demo.data1$ID == i.ID) # find the index the ID exists in 
+  #add the index to the new demo dataset
+  demo.trimmed[i,]<-demo.data1[pos.in.demo,]
+  IDs.handled=IDs.handled+1
+}
+```
+
+```{r merge trimmed datasets}
+# merge the two datasets - should have the same dimensions and therefore cbind will work. 
+full.trimmed<- cbind(data1, demo.trimmed[,c(2:10)])
+
+# then we trim the full dataset to only consider observations of hysterectomy with levels 'yes' and 'no'
+yes<- which(full.trimmed$hysterectomy=='1')
+no<- which(full.trimmed$hysterectomy=='2')
+yes.trimmed<-full.trimmed[c(yes),]
+no.trimmed<-full.trimmed[c(no),]
+final.trimmed<-rbind(yes.trimmed, no.trimmed)
+```
+
+We want to explore the levels of each of the other variables, confirm they are of the correct type, and consider how missingness factors into our analysis. 
+```{r data exploration and summary}
+attach(final.trimmed)
+summary(final.trimmed)
+final.trimmed$ID<-as.factor(final.trimmed$ID)
+final.trimmed$hysterectomy<-as.factor(final.trimmed$hysterectomy)
+levels(as.factor(hysterectomy))
+```
+
+
+
+```{r deleting refused and don't know} 
+#gets index of rows to be removed because refused or dont know
+rows.remove <- which(periodReason == 99 | doctor == 9 | beenPregnant == 9 | numPregnant == 77 | numDeliveries == 77 | numDeliveries == 99 | pelvicInfection == 7 | pelvicInfection == 9 | ageFirstLiveBirth == 777 | ageFirstLiveBirth == 999 | ageLastLiveBirth == 999 | useFemaleHormones == 7 | useFemaleHormones == 9 | birthCountry == 77 | birthCountry == 99 | timeInUS == 77 | timeInUS == 99 | education == 7 | education == 9 | maritalStatus == 77 | maritalStatus == 99 | currentlyPregnant == 7 | currentlyPregnant == 9)
+
+#creates new data set with rows removed
+new.trimmed<-final.trimmed[-c(rows.remove),]
+#deleted 99 rows now at 3931
+```
+
+```{r regular periods}
+#12-150 years old
+#no missing
+new.trimmed[c(which(new.trimmed$regularPeriods==1)),3]<-"Yes"
+new.trimmed[c(which(new.trimmed$regularPeriods==2)),3]<-"No"
+```
+
+```{r period reason}
+#20-150 years old
+(sum(is.na(new.trimmed$periodReason)/3917))*100 #44% missing
+new.trimmed[is.na(new.trimmed$periodReason)==TRUE,]
+#doesn't seem correlated with age, perhaps exclude 
+```
+```{r doctor}
+#18-59 
+(sum(is.na(new.trimmed$doctor)/3917))*100 #36% missing
+new.trimmed[c(which(new.trimmed$age>=59)),5]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$doctor==1)),5]<-"Yes"
+new.trimmed[c(which(new.trimmed$doctor==2)),5]<-"No"
+```
+
+```{r been pregnant}
+#20-150 years old
+(sum(is.na(new.trimmed$beenPregnant)/3917))*100 #0.03% missing
+new.trimmed<-new.trimmed[-c(256),]
+new.trimmed[c(which(new.trimmed$beenPregnant==1)),6]<-"Yes"
+new.trimmed[c(which(new.trimmed$beenPregnant==2)),6]<-"No"
+```
+
+```{r currently pregnant}
+#20-44
+new.trimmed[c(which(new.trimmed$currentlyPregnant==1)),7]<-"Yes"
+new.trimmed[c(which(new.trimmed$currentlyPregnant==2)),7]<-"No"
+new.trimmed[c(which(new.trimmed$age>44)),7]<-"Does Not Apply"
+new.trimmed[c(which(new.trimmed$age<20)),7]<-"Does Not Apply"
+new.trimmed[is.na(new.trimmed$currentlyPregnant)==TRUE,]
+```
+
+```{r num pregnant}
+#20-150 years old
+(sum(is.na(new.trimmed$numPregnant)/3917))*100 #16% missing
+new.trimmed[c(which(new.trimmed$beenPregnant=="No")),8]<-"Does not apply"
+```
+
+```{r num deliveries}
+#12-150 years old
+(sum(is.na(new.trimmed$numDeliveries)/3917))*100 #17% missing
+new.trimmed[c(which(new.trimmed$beenPregnant=="No")),9]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$currentlyPregnant=="Yes")),9] <- "Does not apply"
+new.trimmed[c(which(new.trimmed$numPregnant==1)),9] <- "Does not apply"
+new.trimmed<-new.trimmed[-c(678,1118,2818),]
+```
+
+```{r pelvic infection}
+#18-59 year olds
+(sum(is.na(new.trimmed$pelvicInfection)/3917))*100 #35% missing
+new.trimmed[c(which(new.trimmed$age>=59)),10]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$pelvicInfection==1)),10]<-"Yes"
+new.trimmed[c(which(new.trimmed$pelvicInfection==2)),10]<-"No"
+```
+
+```{r age first live birth}
+#20-59 year olds
+(sum(is.na(new.trimmed$ageFirstLiveBirth)/3917))*100 #53% missing
+new.trimmed[c(which(new.trimmed$age>=59 | new.trimmed$beenPregnant=="No" | new.trimmed$numDeliveries == 0)),11]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$currentlyPregnant=="Yes" & new.trimmed$numPregnant == 1)),11] <- "Does not apply"
+missing.first.birth<-which(is.na(new.trimmed$ageFirstLiveBirth))
+new.trimmed<-new.trimmed[-c(missing.first.birth),]
+#31 people left, possibly impute agelastlivebirth if one delivery
+```
+
+```{r age last live birth}
+#20-59 year olds
+(sum(is.na(new.trimmed$ageLastLiveBirth)/3917))*100 #52% missing
+new.trimmed[c(which(new.trimmed$age>=59)),12]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$beenPregnant=="No")),12]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$numDeliveries==0)),12]<-"Does not apply"
+new.trimmed[c(which(new.trimmed$currentlyPregnant=="Yes" & new.trimmed$numPregnant == 1)),12] <- "Does not apply"
+new.trimmed[is.na(new.trimmed$ageLastLiveBirth)==TRUE,]
+missing.last.birth<-which(is.na(new.trimmed$ageLastLiveBirth))
+new.trimmed<-new.trimmed[-c(missing.last.birth),]
+```
+
+```{r use female hormones}
+#20-150 year olds
+(sum(is.na(new.trimmed$useFemaleHormones)/3917))*100 #0.1% missing
+new.trimmed<-new.trimmed[-c(678,1119,2829),]
+new.trimmed[c(which(new.trimmed$useFemaleHormones==1)),13]<-"Yes"
+new.trimmed[c(which(new.trimmed$useFemaleHormones==2)),13]<-"No"
+levels(as.factor(new.trimmed$useFemaleHormones))
+```
+
+```{r age}
+#0-150 year olds
+```
+
+```{r race}
+#0-150 years old
+new.trimmed[c(which(new.trimmed$race==1)),15]<-"Mexican American"
+new.trimmed[c(which(new.trimmed$race==2)),15]<-"Other Hispanic"
+new.trimmed[c(which(new.trimmed$race==3)),15]<-"Non-Hispanic White"
+new.trimmed[c(which(new.trimmed$race==4)),15]<-"Non-Hispanic Black"
+new.trimmed[c(which(new.trimmed$race==6)),15]<-"Non-Hispanic Asian"
+new.trimmed[c(which(new.trimmed$race==7)),15]<-"Other Race-Including Multi-Racial"
+```
+
+```{r birth country}
+#0-150 years old
+new.trimmed[c(which(new.trimmed$birthCountry==1)),16]<-"US"
+new.trimmed[c(which(new.trimmed$birthCountry==2)),16]<-"Other"
+```
+
+```{r time in us}
+#0-150 years old
+(sum(is.na(new.trimmed$timeInUS)/3917))*100 #73% missing
+new.trimmed[c(which(new.trimmed$birthCountry=="US")),17]<-"Does Not Apply"
+```
+
+```{r education}
+#20-150 years old
+new.trimmed[c(which(new.trimmed$education==1)),18]<-"Less than 9th Grade"
+new.trimmed[c(which(new.trimmed$education==2)),18]<-"9-11th Grade"
+new.trimmed[c(which(new.trimmed$education==3)),18]<-"High School Graduate"
+new.trimmed[c(which(new.trimmed$education==4)),18]<-"Some College or AA"
+new.trimmed[c(which(new.trimmed$education==5)),18]<-"College Graduate or Above"
+```
+
+```{r marital status}
+#20-150 years old
+new.trimmed[c(which(new.trimmed$maritalStatus==1)),19]<-"Married/Living with Partner"
+new.trimmed[c(which(new.trimmed$maritalStatus==2)),19]<-"Widowed, Divorced, or Separated"
+new.trimmed[c(which(new.trimmed$maritalStatus==3)),19]<-"Never Married"
+```
+
+```{r interview language}
+#0-150 years old
+new.trimmed[c(which(new.trimmed$interviewLanguage==1)),20]<-"English"
+new.trimmed[c(which(new.trimmed$interviewLanguage==2)),20]<-"Spanish"
+```
+
+```{r interpreter}
+#0-150 years old
+new.trimmed[c(which(new.trimmed$interpreter==1)),21]<-"Yes"
+new.trimmed[c(which(new.trimmed$interpreter==2)),21]<-"No"
+```
+
+```{r income poverty ratio}
+#0-150 years old
+(sum(is.na(new.trimmed$incomeToPovertyRatio)/3917))*100 #0.1% missing
+length(which(is.na(new.trimmed$incomeToPovertyRatio)==TRUE))
+#look back at this still 472 missing
+head(new.trimmed,6)
+```
+```{r hysterectomy labels}
+#0-150 years old
+new.trimmed$hysterectomy<- as.character(new.trimmed$hysterectomy)
+new.trimmed[c(which(new.trimmed$hysterectomy=='1')),2]<- "Yes"
+new.trimmed[c(which(new.trimmed$hysterectomy=='2')),2]<- "No"
+#look back at this still 472 missing
+head(new.trimmed)
+```
+
+```{r final data set}
+data.final<-new.trimmed[,-c(1,3,4,7,22)] # remove ID, regular period, periodReason, currently pregnant, and incomeToPoveryRatio
+summary(data.final)
+
+attach(data.final)
+```
+
+```{r fix levels}
+#table(data.final$hysterectomy)
+#table(data.final$regularPeriods)
+#table(data.final$doctor)
+#table(data.final$beenPregnant)
+#combine 8 - 11 as 8 to indicate 8+
+data.final[c(which(data.final$numPregnant==8)),4]<-8
+data.final[c(which(data.final$numPregnant==9)),4]<-8
+data.final[c(which(data.final$numPregnant==10)),4]<-8
+data.final[c(which(data.final$numPregnant==11)),4]<-8
+table(data.final$numPregnant)
+#table(data.final$numDeliveries)
+#table(data.final$pelvicInfection)
+table(data.final$ageFirstLiveBirth) #ages 40+ set as 40
+data.final[c(which(data.final$ageFirstLiveBirth==40)),7]<-40
+data.final[c(which(data.final$ageFirstLiveBirth==41)),7]<-40
+data.final[c(which(data.final$ageFirstLiveBirth==42)),7]<-40
+data.final[c(which(data.final$ageFirstLiveBirth==43)),7]<-40
+
+table(data.final$ageLastLiveBirth) #ages 40+ set as 40
+data.final[c(which(data.final$ageLastLiveBirth==40)),8]<-40
+data.final[c(which(data.final$ageLastLiveBirth==41)),8]<-40
+data.final[c(which(data.final$ageLastLiveBirth==42)),8]<-40
+data.final[c(which(data.final$ageLastLiveBirth==43)),8]<-40
+data.final[c(which(data.final$ageLastLiveBirth==44)),8]<-40
+data.final[c(which(data.final$ageLastLiveBirth==45)),8]<-40
+
+#table(data.final$useFemaleHormones)
+#table(data.final$age)
+#table(data.final$race)
+#table(data.final$birthCountry)
+#table(data.final$timeInUS)
+#table(data.final$education)
+#table(data.final$maritalStatus)
+#table(data.final$interviewLanguage)
+#table(data.final$interpreter)
+```
+
+```{r correct column type}
+# age needs to be a factor
+colnames(new.data)
+col.types<-c()
+for(i in 1:ncol(new.data)){
+  type<-typeof(new.data[,i])
+  col.types<-append(col.types,type)
+}
+col.types
+# ensure that predictors are of type factor not character
+data.final$hysterectomy<-as.factor(data.final$hysterectomy)
+data.final$doctor<-as.factor(data.final$doctor)
+data.final$beenPregnant<-as.factor(data.final$beenPregnant)
+data.final$numPregnant<-as.factor(data.final$numPregnant)
+data.final$numDeliveries<-as.factor(data.final$numDeliveries)
+data.final$pelvicInfection<-as.factor(data.final$pelvicInfection)
+data.final$ageFirstLiveBirth<-as.factor(data.final$ageFirstLiveBirth)
+data.final$ageLastLiveBirth<-as.factor(data.final$ageLastLiveBirth)
+data.final$useFemaleHormones<-as.factor(data.final$useFemaleHormones)
+#data.final$age<- as.factor(data.final$age)
+data.final$race<- as.factor(data.final$race)
+data.final$birthCountry<-as.factor(data.final$birthCountry)
+data.final$timeInUS<-as.factor(data.final$timeInUS)
+data.final$education<-as.factor(data.final$education)
+data.final$maritalStatus<-as.factor(data.final$maritalStatus)
+data.final$interviewLanguage<-as.factor(data.final$interviewLanguage)
+data.final$interpreter<-as.factor(data.final$interpreter)
+```
+
+```{r cramer v correlation}
+new.data<-data.final[,-c(2, 3, 5, 12, 16, 17)]
+#checking manually 
+levels(data.final$hysterectomy)
+  #no strongly correlated variables 
+levels(data.final$doctor)
+  #strongly correlated with pelvic infection - 0.70716319
+# strongly correlated with age at first live birth - 0.54780
+# strongly correlated w age at last live birth - 0.53040
+# strongly corelated with age - 0.71650
+levels(data.final$numPregnant) 
+  #strongly correlated with been pregnant - 1.00000
+  # strongly correlated with num deliveries - 0.56870 #remove numDeliveries. 
+levels(data.final$beenPregnant) # remove been Pregnant
+# strongly correlated with numpregnant - 1.0000
+#strongly correlated with numdeliveries - 0.73210
+# Strongly correlated with age -0.49000
+levels(data.final$pelvicInfection)
+#strongly correlated with doctor - 0.70716319
+# strongly correlated with age at first live birth - 0.52850
+#strongly correlated with age at last live birth - 0.52570
+#strongly correlated with age - 0.71740
+levels(data.final$useFemaleHormones)
+  #no strongly correlated variables
+levels(data.final$race)
+  #strong correlation with interview language - 0.6191207
+# strongly correlated with birth country - 0.70490
+levels(data.final$birthCountry) # remove birthCountry
+#linearly correlated with timeinUS - 1.00000
+#strongly correlated with interview language - 0.50020
+levels(data.final$timeInUS)
+  #strongly correlated with interview language - 0.50730
+levels(data.final$education)
+  #somewhat atrongly correlated with interview language - 0.47180
+levels(data.final$maritalStatus)
+  #no strongly correlated variables
+levels(data.final$interviewLanguage) # remove interview language 
+  #no strongly correlated variables
+levels(data.final$interpreter) # remove interpreter. 
+  #no strongly correlated variables
+  
+attach(new.data)
+correlation<-data.frame(matrix(ncol = ncol(new.data), nrow = ncol(new.data)))
+colnames(correlation) <- colnames(new.data)
+rownames(correlation)<- colnames(new.data)
+for(i in 1:ncol(new.data)){
+  for(j in 1:ncol(new.data)){
+    cor<-cramerV(new.data[,i],new.data[,j])
+    correlation[i,j]<-cor
+  }
+}
+correlation
+#cramerV(hysterectomy,doctor)
+```
+
+```{r all subset selection}
+# X<-model.matrix(hysterectomy~.,data=new.data)[,-1]
+# X<-X[,-34]
+# Xy <- as.data.frame(X,hysterectomy)
+# AIC.best<-bestglm(Xy,IC="AIC")
+# AIC.best$BestModels
+# BIC.best<-bestglm(new.data,IC="BIC",family=binomial)
+# BIC.best$BestModel
+
+#finding perfect linear dependency
+# correlation<-data.frame(matrix(ncol = ncol(X), nrow = ncol(X)))
+# colnames(correlation) <- colnames(X)
+# rownames(correlation)<- colnames(X)
+# for(i in 1:ncol(X)){
+#   for(j in 1:ncol(X)){
+#     cor<-cramerV(X[,i],X[,j])
+#     correlation[i,j]<-cor
+#   }
+# }
+# correlation
+# 
+# for(i in 1:75)
+# {
+#   for(j in (i+1):75)
+#   {
+#     if(correlation[i,j]==1)
+#       print(c(i,j))
+#   }
+# }
+# 
+# correlation[34,58]
+# X[,34]
+
+# result.CP=leaps(x, y, int=TRUE, method=c("Cp"), nbest=10)
+# which.min(result.CP$Cp)
+# result.CP$which[71,]
+# 
+# result.adjr2=leaps(x, y, int=TRUE, method=c("adjr2"), nbest=10)
+# which.min(result.adjr2$adjr2)
+# result.adjr2$which[10,]
+```
+```{r all models}
+model.full<-glm(hysterectomy~., data=new.data, family=binomial(link=logit))
+result.BIC <- step(model.full,direction="both",k=log(dim(new.data)[1]),trace=0)
+result.AIC <- step(model.full, direction="both",trace=0, k=2)
+```
+
+```{r k-fold}
+#k fold cv
+train_control <- trainControl(method = "cv", number = 10)
+
+full <- train(hysterectomy~., data = new.data, trControl = train_control, method = "glm") # accuracy = 0.7989503
+#full
+
+model.AIC<-train(hysterectomy ~ numPregnant + ageLastLiveBirth + useFemaleHormones + age + race + education + maritalStatus, data=new.data, method="glm", trControl=train_control) # accuracy = 0.803953
+#model.AIC
+
+model.BIC<-train(hysterectomy ~ useFemaleHormones + age + education, data=new.data, method="glm", trControl=train_control) # accuracy = 0.7989454
+#model.BIC
+
+```
+The k fold cross validation scores essentially tell us that each of the models performs comparably well alongside each other. The model with the greatest accuracy score (highest amount of correct classifications) is our stepwise regression AIC criterion model. This includes predictors:numPregnant, ageLastLiveBirth, useFemaleHormones, age, race, education, and maritalStatus. 
+
+
+```{r final models}
+full <- glm(hysterectomy~., data = new.data, family=binomial(link=logit)) 
+
+aic<-glm(hysterectomy ~ numPregnant + ageLastLiveBirth + useFemaleHormones + age + race + education + maritalStatus, data=new.data, family=binomial(link=logit))
+
+bic<-glm(hysterectomy ~ useFemaleHormones + age + education, data=new.data, family=binomial(link=logit))
+```
+
+```{r likelihood ratio}
+library(lmtest)
+lrtest(full,aic)
+```
+
+```{r ratio of hysterectomy}
+table(new.data$hysterectomy)
+845/(845+2946)
+```
+
+```{r full model performance metrics}
+attach(new.data)
+#threshold 0.1
+pi.hat.full = predict(full,type="response") #predicted prob
+Y.hat.full = ifelse(pi.hat>0.1,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+plot(roc(hysterectomy,pi.hat.full))
+auc(hysterectomy,pi.hat.full) # AUC: 0.8482
+#threshold 0.15
+pi.hat = predict(full,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.15,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.2
+pi.hat = predict(full,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.2,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.25
+pi.hat = predict(full,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.25,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.3
+pi.hat = predict(full,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.3,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+accuracy.1<-(1555+808)/(1555+808+37+1391)
+specificity.1<-1555/(1555+1391)
+sensitivity.1<-808/(808+37)
+precision.1<-808/(808+1391)
+
+accuracy.15<-(1827+763)/(1827+763+82+1119)
+specificity.15<-1827/(1827+1119)
+sensitivity.15<-763/(763+82)
+precision.15<-763/(763+1119)
+
+accuracy.2<-(2074+707)/(2074+707+138+872)
+specificity.2<-2074/(2074+872)
+sensitivity.2<-707/(707+138)
+precision.2<-707/(707+872)
+
+accuracy.25<-(2251+635)/(2251+635+210+695)
+specificity.25<-2251/(2251+695)
+sensitivity.25<-635/(635+210)
+precision.25<-635/(635+695)
+
+accuracy.3<-(2417+572)/(2417+572+273+529)
+specificity.3<-2417/(2417+529)
+sensitivity.3<-572/(572+273)
+precision.3<-572/(572+529)
+
+full.1<-c(accuracy.1, specificity.1, sensitivity.1, precision.1)
+full.15<-c(accuracy.15, specificity.15, sensitivity.15, precision.15)
+full.2<-c(accuracy.2, specificity.2, sensitivity.2, precision.2)
+full.25<-c(accuracy.25, specificity.25, sensitivity.25, precision.25)
+full.3<-c(accuracy.3, specificity.3, sensitivity.3, precision.3)
+df.performance.full<-rbind(full.1, full.15, full.2, full.25, full.3)
+colnames(df.performance.full)<-c('accuracy', 'specificity', 'sensitivity', 'precision')
+rownames(df.performance.full)<-c('0.1', '0.15', '0.20', '0.25', '0.3')
+df.performance.full
+```
+
+
+
+```{r AIC performance metrics}
+#threshold 0.1
+pi.hat.aic = predict(aic,type="response") #predicted prob
+Y.hat.aic = ifelse(pi.hat>0.1,1,0) #dichomotize using 0.5
+table(Y.hat.aic,hysterectomy)
+plot(roc(hysterectomy,pi.hat.aic))
+auc(hysterectomy,pi.hat.aic) # AUC: 0.846
+#threshold 0.15
+pi.hat = predict(aic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.15,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.2
+pi.hat = predict(aic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.2,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.25
+pi.hat = predict(aic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.25,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.3
+pi.hat = predict(aic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.3,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+accuracy.1<-(1544+808)/(1544+808+37+1402)
+specificity.1<-1544/(1544+1402)
+sensitivity.1<-808/(808+37)
+precision.1<-808/(808+1402)
+
+accuracy.15<-(1831+760)/(1831+760+85+1115)
+specificity.15<-1831/(1831+1115)
+sensitivity.15<-760/(760+85)
+precision.15<-760/(760+1115)
+
+accuracy.2<-(2083+705)/(2083+705+140+863)
+specificity.2<-2083/(2083+863)
+sensitivity.2<-705/(705+140)
+precision.2<-705/(705+863)
+
+accuracy.25<-(2265+629)/(2265+629+216+681)
+specificity.25<-2265/(2265+681)
+sensitivity.25<-629/(629+216)
+precision.25<-629/(629+681)
+
+accuracy.3<-(2405+560)/(2405+560+285+541)
+specificity.3<-2405/(2405+541)
+sensitivity.3<-560/(560+285)
+precision.3<-560/(560+541)
+
+aic.1<-c(accuracy.1, specificity.1, sensitivity.1, precision.1)
+aic.15<-c(accuracy.15, specificity.15, sensitivity.15, precision.15)
+aic.2<-c(accuracy.2, specificity.2, sensitivity.2, precision.2)
+aic.25<-c(accuracy.25, specificity.25, sensitivity.25, precision.25)
+aic.3<-c(accuracy.3, specificity.3, sensitivity.3, precision.3)
+df.performance.aic<-rbind(aic.1, aic.15, aic.2, aic.25, aic.3)
+colnames(df.performance.aic)<-c('accuracy', 'specificity', 'sensitivity', 'precision')
+rownames(df.performance.aic)<-c('0.1', '0.15', '0.20', '0.25', '0.3')
+df.performance.aic
+```
+
+```{r BIC performance metrics}
+#threshold 0.1
+pi.hat.bic = predict(bic,type="response") #predicted prob
+Y.hat.bic = ifelse(pi.hat.bic>0.1,1,0) #dichomotize using 0.5
+table(Y.hat.bic,hysterectomy)
+plot(roc(hysterectomy,pi.hat.bic))
+auc(hysterectomy,pi.hat.bic) # AUC: 0.8271 - all threshold have same area under the curve
+#threshold 0.15
+pi.hat = predict(bic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.15,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.2
+pi.hat = predict(bic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.2,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.25
+pi.hat = predict(bic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.25,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.3
+pi.hat = predict(bic,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.3,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+accuracy.1<-(1462+797)/(1462+797+48+1484)
+specificity.1<-1462/(1462+1484)
+sensitivity.1<-797/(797+48)
+precision.1<-797/(797+1484)
+
+accuracy.15<-(1830+737)/(1830+737+108+1116)
+specificity.15<-1830/(1830+1116)
+sensitivity.15<-737/(737+108)
+precision.15<-737/(737+1116)
+
+accuracy.2<-(2112+659)/(2112+659+186+834)
+specificity.2<-2112/(2112+834)
+sensitivity.2<-659/(659+186)
+precision.2<-659/(659+834)
+
+accuracy.25<-(2291+585)/(2291+585+260+655)
+specificity.25<-2291/(2291+655)
+sensitivity.25<-585/(585+260)
+precision.25<-585/(585+655)
+
+accuracy.3<-(2445+505)/(2445+505+340+501)
+specificity.3<-2445/(2445+501)
+sensitivity.3<-505/(505+340)
+precision.3<-505/(505+501)
+
+bic.1<-c(accuracy.1, specificity.1, sensitivity.1, precision.1)
+bic.15<-c(accuracy.15, specificity.15, sensitivity.15, precision.15)
+bic.2<-c(accuracy.2, specificity.2, sensitivity.2, precision.2)
+bic.25<-c(accuracy.25, specificity.25, sensitivity.25, precision.25)
+bic.3<-c(accuracy.3, specificity.3, sensitivity.3, precision.3)
+df.performance.bic<-rbind(bic.1, bic.15, bic.2, bic.25, bic.3)
+colnames(df.performance.bic)<-c('Accuracy', 'Specificity', 'Sensitivity', 'Precision')
+rownames(df.performance.bic)<-c('0.1', '0.15', '0.20', '0.25', '0.3')
+df.performance.bic
+```
+```{r ROC curves}
+par(mfrow=c(3,1))
+plot(roc(hysterectomy,pi.hat.full))
+plot(roc(hysterectomy,pi.hat.aic))
+plot(roc(hysterectomy,pi.hat.bic))
+
+df.performance<-rbind(full.2, aic.2, bic.2)
+colnames(df.performance)<-c('Accuracy', 'Specificity', 'Sensitivity', 'Precision')
+rownames(df.performance)<-c('Saturated Model', 'Stepwise AIC', 'Stepwise BIC')
+df.performance
+```
+
+```{r model diagnostics}
+plot(aic) 
+#outliers at 4317, 1313, 1730, 1903, 3228, 4780
+full.trimmed[c(4317, 1313, 1730, 1903, 3228, 4780),] #why are the first and last included if there's not even 4000 rows? 
+summary(aic)
+new.trimmed[c(which(new.trimmed$ID=="121891")),]
+new.trimmed[c(which(new.trimmed$ID=="113109")),]
+new.trimmed[c(which(new.trimmed$ID=="114320")),]
+new.trimmed[c(which(new.trimmed$ID=="114803")),]
+new.trimmed[c(which(new.trimmed$ID=="118679")),]
+new.trimmed[c(which(new.trimmed$ID=="123273")),]
+
+# rows<- c(which(new.trimmed$ID=="121891"),which(new.trimmed$ID=="113109"),which(new.trimmed$ID=="114320"),
+#          which(new.trimmed$ID=="114803"),which(new.trimmed$ID=="118679"),which(new.trimmed$ID=="123273"))
+
+devdf<-data.frame(matrix(ncol=2,nrow=nrow(new.data)))
+devdf[,1]<-1:nrow(new.data)
+for (i in 1:nrow(new.data)) 
+{
+  new.data2<-new.data[-c(i),]
+  aic2<-glm(hysterectomy ~ numPregnant + ageLastLiveBirth + useFemaleHormones + age + race + education + maritalStatus, data=new.data2, family=binomial(link=logit))
+  dev<-aic$deviance - aic2$deviance
+  devdf[i,2]<-dev
+}
+
+plot(x=devdf[,1],y=devdf[,2],xlab="Case Number",ylab="Delta Deviance",main="Delta Deviance Plot")
+
+devdf[c(which(devdf[,2]>=38)),]
+
+new.data<-new.data[-c(1,5,52,254,272,510,770),]
+
+aic<-glm(hysterectomy ~ numPregnant + ageLastLiveBirth + useFemaleHormones + age + race + education + maritalStatus, data=new.data, family=binomial(link=logit))
+summary(aic)
+
+
+#library(blorr)
+#blr_plot_diag_difdev(aic)
+```
+
+Given the relatively small number of predators in the best (BIC) model, it's reasonable to explore possible two-way interaction terms.
+```{r consider interaction terms to BIC model BIC criterion}
+best.BIC <- glm(hysterectomy ~ useFemaleHormones + age + education, data=new.data, family=binomial(link=logit)) #define your best BIC glm model here
+step(best.BIC, .~.^2, direction="both", k=log(dim(new.data)[1])) 
+```
+
+```{r consider interaction terms to BIC model AIC criterion}
+step(best.BIC, .~.^2, direction="both", k=2) 
+```
+
+Best Interaction Model based on Best BIC first order model using stepwise regression with BIC as criterion:
+hysterectomy ~ useFemaleHormones + age + education + useFemaleHormones:age
+
+Best Interaction Model based on Best BIC first order model using stepwise regression with AIC as criterion:
+hysterectomy ~ useFemaleHormones + age + education + useFemaleHormones:age
+
+Using stepwise regression with AIC and BIC as criterion for selecting the best second order model based on our best BIC first order model produced the same result. hat(log(hysterectomy)) = B0 + B1*useFemaleHormones + B2*age + B3*education + B4*useFemaleHormones:age
+
+We can conduct k fold cross validation for comparison
+```{r cv on interaction}
+model.BIC.Interact<-train(hysterectomy ~ useFemaleHormones + age + education + useFemaleHormones:age, data=new.data, method="glm", trControl=train_control) # accuracy = 0.8050647
+```
+In terms of accuracy our interaction model performs best but again only marginally.
+
+We can then perform another likelihood ratio test to see if the addition of the interaction terms sufficiently fits the data better than the reduced model (in this case our first order AIC model). 
+```{r likelihood ratio test interaction vs. AIC}
+interaction<-glm(hysterectomy ~ useFemaleHormones + age + education + useFemaleHormones:age, data=new.data, family=binomial(link=logit))
+library(lmtest)
+lrtest(bic,interaction)
+lrtest(aic, interaction)
+```
+
+```{r performance metrics}
+#threshold 0.1
+pi.hat = predict(interaction,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.1,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+plot(roc(hysterectomy,pi.hat))
+auc(hysterectomy,pi.hat) # AUC: 0.8266
+#threshold 0.15
+pi.hat = predict(interaction,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.15,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.2
+pi.hat = predict(interaction,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.2,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.25
+pi.hat = predict(interaction,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.25,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+#threshold 0.3
+pi.hat = predict(interaction,type="response") #predicted prob
+Y.hat = ifelse(pi.hat>0.3,1,0) #dichomotize using 0.5
+table(Y.hat,hysterectomy)
+
+accuracy.1<-(1534+793)/(1534+793+52+1412)
+specificity.1<-1534/(1534+1412)
+sensitivity.1<-793/(793+52)
+precision.1<-793/(793+1412)
+
+accuracy.15<-(1834+731)/(1834+731+114+1112)
+specificity.15<-1834/(1834+1112)
+sensitivity.15<-731/(731+114)
+precision.15<-731/(731+1112)
+
+accuracy.2<-(2067+670)/(2067+670+175+879)
+specificity.2<-2067/(2067+879)
+sensitivity.2<-670/(670+175)
+precision.2<-670/(670+879)
+
+accuracy.25<-(2234+608)/(2234+608+237+712)
+specificity.25<-2234/(2234+712)
+sensitivity.25<-608/(608+237)
+precision.25<-608/(608+712)
+
+accuracy.3<-(2374+532)/(2374+532+313+572)
+specificity.3<-2374/(2374+572)
+sensitivity.3<-532/(532+313)
+precision.3<-532/(532+572)
+
+interact.1<-c(accuracy.1, specificity.1, sensitivity.1, precision.1)
+interact.15<-c(accuracy.15, specificity.15, sensitivity.15, precision.15)
+interact.2<-c(accuracy.2, specificity.2, sensitivity.2, precision.2)
+interact.25<-c(accuracy.25, specificity.25, sensitivity.25, precision.25)
+interact.3<-c(accuracy.3, specificity.3, sensitivity.3, precision.3)
+df.performance.interact<-rbind(interact.1, interact.15, interact.2, interact.25, interact.3)
+colnames(df.performance.interact)<-c('accuracy', 'specificity', 'sensitivity', 'precision')
+rownames(df.performance.interact)<-c('0.1', '0.15', '0.20', '0.25', '0.3')
+df.performance.interact
+```
+Our first order AIC model and first order full model still perform best in terms of sensitivity. 
